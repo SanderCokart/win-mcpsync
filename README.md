@@ -103,3 +103,7 @@ bash test/run.sh                              # same suite against the bash vers
 ```
 
 To release: set the version in `Cargo.toml`, then push a matching tag (`git tag v1.0.0 && git push origin v1.0.0`).
+
+## License
+
+MIT. See [LICENSE](LICENSE).

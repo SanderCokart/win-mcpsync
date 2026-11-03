@@ -3,6 +3,7 @@ name = "mcpsync"
 description = "Define MCP servers once and sync them to every editor you use (Windows)"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 envsync-core = { workspace = true }

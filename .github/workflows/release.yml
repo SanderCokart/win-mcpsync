@@ -47,7 +47,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           foreach ($app in 'mcpsync', 'envsync') {
-            Compress-Archive -Force -Path "target/$env:TARGET/release/$app.exe" -DestinationPath "dist/$app-$env:TARGET.zip"
+            Compress-Archive -Force -Path "target/$env:TARGET/release/$app.exe", LICENSE -DestinationPath "dist/$app-$env:TARGET.zip"
           }
           $lines = Get-ChildItem dist/*.zip | Sort-Object Name | ForEach-Object {
             '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $_.Name

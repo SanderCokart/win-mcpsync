@@ -3,6 +3,7 @@ name = "envsync-core"
 description = "Windows user environment variables shared with WSL (library behind envsync and mcpsync)"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 serde_json = { workspace = true }
