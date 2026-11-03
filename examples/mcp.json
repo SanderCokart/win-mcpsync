@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "github": {
+      "type": "http",
+      "url": "https://api.githubcopilot.com/mcp/",
+      "headers": {
+        "Authorization": "Bearer ${GITHUB_MCP_PAT}"
+      }
+    },
+    "example-dokploy": {
+      "command": "npx",
+      "args": ["-y", "@ahdev/dokploy-mcp"],
+      "env": {
+        "DOKPLOY_URL": "https://dokploy.example.com/api",
+        "DOKPLOY_API_KEY": "${DOKPLOY_API_KEY}"
+      }
+    }
+  }
+}

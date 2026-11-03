@@ -1,0 +1,17 @@
+[package]
+name = "envsync-core"
+description = "Windows user environment variables shared with WSL (library behind envsync and mcpsync)"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde_json = { workspace = true }
+rpassword = "7"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_System_Console",
+  "Win32_UI_WindowsAndMessaging",
+] }

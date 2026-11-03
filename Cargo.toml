@@ -1,0 +1,20 @@
+[workspace]
+members = ["crates/envsync-core", "crates/envsync", "crates/mcpsync"]
+resolver = "2"
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+repository = "https://github.com/SanderCokart/win-mcpsync"
+
+[workspace.dependencies]
+envsync-core = { path = "crates/envsync-core" }
+serde_json = { version = "1", features = ["preserve_order"] }
+regex = "1"
+similar = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

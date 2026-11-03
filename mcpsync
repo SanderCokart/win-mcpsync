@@ -1,0 +1,1282 @@
+#!/usr/bin/env bash
+# mcpsync — define your MCP servers once, sync them to every editor you use.
+#
+# Source of truth : ~/.config/mcpsync/mcp.json   (or <project>/.mcpsync.json with --project)
+# Settings        : ~/.config/mcpsync/config      (which editors you use, fallback policy, ...)
+# Secrets         : referenced as ${VAR} / ${VAR:-default}; values live in your environment
+#                   (Windows user env + WSLENV, or ~/.config/mcpsync/secrets.env elsewhere)
+#
+# Requires: bash 3.2+ and Node.js 16+ (already needed by npx-based MCP servers).
+# Works in Git Bash on Windows, WSL, macOS and Linux. Run `mcpsync help`.
+set -euo pipefail
+
+MCPSYNC_VERSION="0.2.0"
+MCPSYNC_HOME="${MCPSYNC_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/mcpsync}"
+SOURCE_FILE="${MCPSYNC_SOURCE:-$MCPSYNC_HOME/mcp.json}"
+CONFIG_FILE="$MCPSYNC_HOME/config"
+STATE_FILE="$MCPSYNC_HOME/state.json"
+BACKUP_DIR="$MCPSYNC_HOME/backups"
+SECRETS_FILE="$MCPSYNC_HOME/secrets.env"
+
+SUPPORTED_EDITORS=(claude-code cursor codex claude-desktop vscode gemini devin)
+
+# Defaults; $CONFIG_FILE overrides them.
+EDITORS=""
+FALLBACK="skip"
+BACKUPS=10
+NPX_WRAP_EDITORS=""
+
+SCOPE="user"
+PROJECT_DIR=""
+STATE_PREFIX=""
+TMPROOT=""
+ENGINE=""
+
+# ---------------------------------------------------------------- output
+if [[ -t 2 ]]; then
+  C_R=$'\e[31m' C_Y=$'\e[33m' C_G=$'\e[32m' C_B=$'\e[1m' C_D=$'\e[2m' C_0=$'\e[0m'
+else
+  C_R="" C_Y="" C_G="" C_B="" C_D="" C_0=""
+fi
+info() { printf '%s\n' "$*" >&2; }
+ok()   { printf '%s✓%s %s\n' "$C_G" "$C_0" "$*" >&2; }
+warn() { printf '%s!%s %s\n' "$C_Y" "$C_0" "$*" >&2; }
+bad()  { printf '%s✗%s %s\n' "$C_R" "$C_0" "$*" >&2; }
+die()  { printf '%serror:%s %s\n' "$C_R" "$C_0" "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------- platform
+detect_platform() {
+  case "$(uname -s)" in
+    Darwin) echo mac ;;
+    MINGW*|MSYS*|CYGWIN*) echo windows ;;
+    Linux) if grep -qi microsoft /proc/version 2>/dev/null; then echo wsl; else echo linux; fi ;;
+    *) echo unknown ;;
+  esac
+}
+PLATFORM="$(detect_platform)"
+
+to_unix_path() {
+  if [[ -n $1 ]] && command -v cygpath >/dev/null 2>&1; then cygpath -u "$1"; else printf '%s\n' "$1"; fi
+}
+win_appdata() {
+  if [[ -n ${APPDATA:-} ]]; then to_unix_path "$APPDATA"; else printf '%s\n' "$HOME/AppData/Roaming"; fi
+}
+xdg_config() { printf '%s\n' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
+codex_home() {
+  if [[ -n ${CODEX_HOME:-} ]]; then to_unix_path "$CODEX_HOME"; else printf '%s\n' "$HOME/.codex"; fi
+}
+
+# ---------------------------------------------------------------- editors
+is_supported() { local e; for e in "${SUPPORTED_EDITORS[@]}"; do [[ $e == "$1" ]] && return 0; done; return 1; }
+is_enabled()   { [[ " $EDITORS " == *" $1 "* ]]; }
+servers_key()  { if [[ $1 == vscode ]]; then echo servers; else echo mcpServers; fi; }
+editor_format() { if [[ $1 == codex ]]; then echo toml; else echo json; fi; }
+
+# Prints the config file an editor reads for the current scope ("" = editor has none).
+editor_file() {
+  local ed=$1 var
+  if [[ $SCOPE == project ]]; then
+    case $ed in
+      claude-code)    printf '%s\n' "$PROJECT_DIR/.mcp.json" ;;
+      cursor)         printf '%s\n' "$PROJECT_DIR/.cursor/mcp.json" ;;
+      codex)          printf '%s\n' "$PROJECT_DIR/.codex/config.toml" ;;
+      vscode)         printf '%s\n' "$PROJECT_DIR/.vscode/mcp.json" ;;
+      gemini)         printf '%s\n' "$PROJECT_DIR/.gemini/settings.json" ;;
+      devin)          printf '%s\n' "$PROJECT_DIR/.devin/mcp_config.json" ;;
+      claude-desktop) printf '\n' ;;
+      *) die "unknown editor: $ed" ;;
+    esac
+    return 0
+  fi
+  var="PATH_$(printf '%s' "$ed" | tr 'a-z-' 'A-Z_')"
+  if [[ -n ${!var:-} ]]; then to_unix_path "${!var}"; return 0; fi
+  case $ed in
+    claude-code)
+      if [[ -n ${CLAUDE_CONFIG_DIR:-} ]]; then printf '%s\n' "$(to_unix_path "$CLAUDE_CONFIG_DIR")/.claude.json"
+      else printf '%s\n' "$HOME/.claude.json"; fi ;;
+    cursor) printf '%s\n' "$HOME/.cursor/mcp.json" ;;
+    codex)  printf '%s\n' "$(codex_home)/config.toml" ;;
+    claude-desktop)
+      case $PLATFORM in
+        mac)     printf '%s\n' "$HOME/Library/Application Support/Claude/claude_desktop_config.json" ;;
+        windows) printf '%s\n' "$(win_appdata)/Claude/claude_desktop_config.json" ;;
+        *)       printf '%s\n' "$(xdg_config)/Claude/claude_desktop_config.json" ;;
+      esac ;;
+    vscode)
+      case $PLATFORM in
+        mac)     printf '%s\n' "$HOME/Library/Application Support/Code/User/mcp.json" ;;
+        windows) printf '%s\n' "$(win_appdata)/Code/User/mcp.json" ;;
+        *)       printf '%s\n' "$(xdg_config)/Code/User/mcp.json" ;;
+      esac ;;
+    gemini) printf '%s\n' "$HOME/.gemini/settings.json" ;;
+    devin)
+      case $PLATFORM in
+        windows) printf '%s\n' "$(win_appdata)/devin/mcp_config.json" ;;
+        *)       printf '%s\n' "$(xdg_config)/devin/mcp_config.json" ;;
+      esac ;;
+    *) die "unknown editor: $ed (supported: ${SUPPORTED_EDITORS[*]})" ;;
+  esac
+}
+
+editor_detected() {
+  local ed=$1 f
+  f="$(editor_file "$ed")"
+  [[ -n $f && -e $f ]] && return 0
+  case $ed in
+    claude-code)    command -v claude >/dev/null 2>&1 ;;
+    cursor)         [[ -d $HOME/.cursor ]] || command -v cursor >/dev/null 2>&1 ;;
+    codex)          [[ -d $(codex_home) ]] || command -v codex >/dev/null 2>&1 ;;
+    claude-desktop) [[ -n $f && -d $(dirname "$f") ]] ;;
+    vscode)         [[ -d $(dirname "$f") ]] || command -v code >/dev/null 2>&1 ;;
+    gemini)         [[ -d $HOME/.gemini ]] || command -v gemini >/dev/null 2>&1 ;;
+    devin)          [[ -d $(dirname "$f") ]] || command -v devin >/dev/null 2>&1 ;;
+    *)              return 1 ;;
+  esac
+}
+
+# ---------------------------------------------------------------- engine (Node.js)
+# All JSON/TOML work happens here. Written to a temp file at startup and run with `node`.
+read -r -d '' ENGINE_JS <<'NODE_ENGINE' || true
+'use strict';
+const fs = require('fs');
+
+// ---------- helpers
+const REF = /\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}/g;
+const IDENT = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/;
+const BEARER = /^Bearer \$\{([A-Za-z_][A-Za-z0-9_]*)\}$/i;
+const hasRef = s => typeof s === 'string' && new RegExp(REF.source).test(s);
+const hasDefault = s => typeof s === 'string' && /\$\{[A-Za-z_][A-Za-z0-9_]*:-/.test(s);
+const isObj = v => v !== null && typeof v === 'object' && !Array.isArray(v);
+const clone = v => JSON.parse(JSON.stringify(v));
+const without = (o, ...keys) => { const c = Object.assign({}, o); for (const k of keys) delete c[k]; return c; };
+
+function fail(msg) { fs.writeSync(2, 'error: ' + msg + '\n'); process.exit(3); }
+function out(s) { if (s) process.stdout.write(s + '\n'); }
+
+function mapStr(v, f) {
+  if (typeof v === 'string') return f(v);
+  if (Array.isArray(v)) return v.map(x => mapStr(x, f));
+  if (isObj(v)) { const o = {}; for (const [k, x] of Object.entries(v)) o[k] = mapStr(x, f); return o; }
+  return v;
+}
+function strings(v, p = [], acc = []) {
+  if (typeof v === 'string') acc.push([p, v]);
+  else if (Array.isArray(v)) v.forEach((x, i) => strings(x, p.concat(i), acc));
+  else if (isObj(v)) for (const [k, x] of Object.entries(v)) strings(x, p.concat(k), acc);
+  return acc;
+}
+const anyDefault = v => strings(v).some(([, s]) => hasDefault(s));
+function refNames(v) {
+  const set = new Set();
+  for (const [, s] of strings(v)) for (const m of s.matchAll(REF)) set.add(m[1]);
+  return [...set].sort();
+}
+const resolve = s => s.replace(REF, (_, n, d) => (process.env[n] ? process.env[n] : (d === undefined ? '' : d)));
+const envColon = s => s.replace(REF, (_, n) => '${env:' + n + '}');
+const unEnv = s => s.replace(/\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}/g, (_, n) => '${' + n + '}');
+const getPath = (o, p) => p.reduce((a, k) => (a == null ? a : a[k]), o);
+function setPath(o, p, v) { let a = o; for (let i = 0; i < p.length - 1; i++) a = a[p[i]]; a[p[p.length - 1]] = v; }
+function sortKeys(v) {
+  if (Array.isArray(v)) return v.map(sortKeys);
+  if (isObj(v)) { const o = {}; for (const k of Object.keys(v).sort()) o[k] = sortKeys(v[k]); return o; }
+  return v;
+}
+
+// ---------- files
+function readText(f) {
+  try { return fs.readFileSync(f, 'utf8').replace(/^﻿/, ''); }
+  catch (e) { if (e.code === 'ENOENT') return null; throw e; }
+}
+// Removes // and /* */ comments and trailing commas outside strings (JSONC -> JSON).
+function stripJsonc(t) {
+  let o = '', i = 0, inStr = false;
+  while (i < t.length) {
+    const c = t[i], n = t[i + 1];
+    if (inStr) {
+      o += c;
+      if (c === '\\') { o += n === undefined ? '' : n; i += 2; continue; }
+      if (c === '"') inStr = false;
+      i++; continue;
+    }
+    if (c === '"') { inStr = true; o += c; i++; continue; }
+    if (c === '/' && n === '/') { while (i < t.length && t[i] !== '\n') i++; continue; }
+    if (c === '/' && n === '*') { i += 2; while (i < t.length && !(t[i] === '*' && t[i + 1] === '/')) i++; i += 2; continue; }
+    if (c === ',') {
+      let j = i + 1;
+      for (;;) {
+        while (j < t.length && /\s/.test(t[j])) j++;
+        if (t[j] === '/' && t[j + 1] === '/') { while (j < t.length && t[j] !== '\n') j++; continue; }
+        if (t[j] === '/' && t[j + 1] === '*') { j += 2; while (j < t.length && !(t[j] === '*' && t[j + 1] === '/')) j++; j += 2; continue; }
+        break;
+      }
+      if (t[j] === '}' || t[j] === ']') { i++; continue; }
+    }
+    o += c; i++;
+  }
+  return o;
+}
+function parseJsonFile(f) {
+  const t = readText(f);
+  if (t === null || !t.trim()) return { data: {}, jsonc: false };
+  try { return { data: JSON.parse(t), jsonc: false }; } catch (e) { /* try JSONC */ }
+  try { return { data: JSON.parse(stripJsonc(t)), jsonc: true }; }
+  catch (e) { fail(f + " isn't valid JSON: " + e.message); }
+}
+function readState(f) {
+  const t = readText(f);
+  if (!t) return {};
+  try { return JSON.parse(t); } catch (e) { return {}; }
+}
+
+// ---------- TOML (just enough for MCP server tables)
+function parseKeyPath(s) {
+  const segs = []; let i = 0;
+  while (i < s.length) {
+    while (s[i] === ' ' || s[i] === '\t') i++;
+    if (s[i] === '"') {
+      let j = i + 1; while (j < s.length && s[j] !== '"') j += s[j] === '\\' ? 2 : 1;
+      segs.push(JSON.parse(s.slice(i, j + 1))); i = j + 1;
+    } else if (s[i] === "'") {
+      const j = s.indexOf("'", i + 1); segs.push(s.slice(i + 1, j)); i = j + 1;
+    } else {
+      let j = i; while (j < s.length && /[A-Za-z0-9_-]/.test(s[j])) j++;
+      if (j === i) break;
+      segs.push(s.slice(i, j)); i = j;
+    }
+    while (s[i] === ' ' || s[i] === '\t') i++;
+    if (s[i] === '.') i++; else break;
+  }
+  return segs;
+}
+// Splits a TOML document into blocks: the preamble, then one block per [table] header.
+function tomlBlocks(text) {
+  const blocks = [{ path: null, lines: [] }];
+  for (const line of text.split(/\r?\n/)) {
+    const m = line.match(/^\[\[?\s*([^\]]*?)\s*\]\]?\s*(#.*)?$/);
+    if (m) blocks.push({ path: parseKeyPath(m[1]), lines: [line] });
+    else blocks[blocks.length - 1].lines.push(line);
+  }
+  return blocks;
+}
+const isServerBlock = b => !!b.path && b.path[0] === 'mcp_servers' && b.path.length >= 2;
+// JSON string escapes are valid TOML, except that TOML also forbids a raw DEL (U+007F).
+const tomlStr = s => JSON.stringify(s).replace(/\u007f/g, '\\u007f');
+const tomlKey = k => (/^[A-Za-z0-9_-]+$/.test(k) ? k : tomlStr(k));
+function tomlVal(v) {
+  if (typeof v === 'string') return tomlStr(v);
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+  if (Array.isArray(v)) return '[' + v.map(tomlVal).join(', ') + ']';
+  if (isObj(v)) return '{ ' + Object.entries(v).map(([k, x]) => tomlKey(k) + ' = ' + tomlVal(x)).join(', ') + ' }';
+  return JSON.stringify(v === null || v === undefined ? '' : String(v));
+}
+function serverToml(name, o) {
+  const lines = ['[mcp_servers.' + tomlKey(name) + ']', '# managed by mcpsync: edit the mcpsync source, then run `mcpsync sync`'];
+  for (const [k, v] of Object.entries(o)) if (v !== undefined) lines.push(tomlKey(k) + ' = ' + tomlVal(v));
+  return lines;
+}
+function trimEnd(lines) { const l = lines.slice(); while (l.length && l[l.length - 1].trim() === '') l.pop(); return l; }
+function tomlSection(text) {
+  return tomlBlocks(text).filter(isServerBlock)
+    .map(b => trimEnd(b.lines).join('\n')).sort().join('\n\n') + '\n';
+}
+function parseTomlKv(t) {
+  let i = 0;
+  const o = {};
+  const ws = () => {
+    for (;;) {
+      while (i < t.length && /[ \t\r\n]/.test(t[i])) i++;
+      if (t[i] === '#') { while (i < t.length && t[i] !== '\n') i++; } else break;
+    }
+  };
+  const setDotted = (obj, path, v) => {
+    let a = obj;
+    for (let k = 0; k < path.length - 1; k++) a = a[path[k]] = isObj(a[path[k]]) ? a[path[k]] : {};
+    a[path[path.length - 1]] = v;
+  };
+  const key = () => {
+    ws();
+    let j = i, q = null;
+    while (j < t.length) {
+      const ch = t[j];
+      if (q) { if (ch === '\\' && q === '"') { j += 2; continue; } if (ch === q) q = null; }
+      else if (ch === '"' || ch === "'") q = ch;
+      else if (ch === '=') break;
+      j++;
+    }
+    if (j >= t.length) throw new Error('expected "=" near: ' + t.slice(i, i + 30));
+    const k = parseKeyPath(t.slice(i, j).trim());
+    i = j + 1;
+    return k;
+  };
+  const val = () => {
+    ws();
+    const c = t[i];
+    if (t.startsWith('"""', i) || t.startsWith("'''", i)) {
+      const q = t.slice(i, i + 3), j = t.indexOf(q, i + 3);
+      const s = t.slice(i + 3, j).replace(/^\r?\n/, ''); i = j + 3; return s;
+    }
+    if (c === '"') {
+      let j = i + 1; while (j < t.length && t[j] !== '"') j += t[j] === '\\' ? 2 : 1;
+      const s = JSON.parse(t.slice(i, j + 1)); i = j + 1; return s;
+    }
+    if (c === "'") { const j = t.indexOf("'", i + 1); const s = t.slice(i + 1, j); i = j + 1; return s; }
+    if (c === '[') {
+      i++; const arr = [];
+      for (;;) { ws(); if (t[i] === ']') { i++; return arr; } arr.push(val()); ws(); if (t[i] === ',') i++; }
+    }
+    if (c === '{') {
+      i++; const obj = {};
+      for (;;) { ws(); if (t[i] === '}') { i++; return obj; } const k = key(); setDotted(obj, k, val()); ws(); if (t[i] === ',') i++; }
+    }
+    const m = t.slice(i).match(/^[^,\]}\s#]+/);
+    if (!m) throw new Error('unexpected TOML near: ' + t.slice(i, i + 30));
+    i += m[0].length;
+    if (m[0] === 'true') return true;
+    if (m[0] === 'false') return false;
+    const num = Number(m[0].replace(/_/g, ''));
+    return Number.isNaN(num) ? m[0] : num;
+  };
+  for (;;) { ws(); if (i >= t.length) break; const k = key(); setDotted(o, k, val()); }
+  return o;
+}
+function parseTomlServers(text) {
+  const servers = {};
+  for (const b of tomlBlocks(text)) {
+    if (!isServerBlock(b)) continue;
+    const name = b.path[1], rest = b.path.slice(2);
+    let kv;
+    try { kv = parseTomlKv(b.lines.slice(1).join('\n')); }
+    catch (e) { fail('could not parse [' + b.path.join('.') + ']: ' + e.message); }
+    let tgt = servers[name] = servers[name] || {};
+    for (const k of rest) tgt = tgt[k] = isObj(tgt[k]) ? tgt[k] : {};
+    Object.assign(tgt, kv);
+  }
+  return servers;
+}
+
+// ---------- source -> editor
+function forEditor(s, ed) {
+  if (Array.isArray(s['x-editors']) && !s['x-editors'].includes(ed)) return false;
+  if (Array.isArray(s['x-exclude-editors']) && s['x-exclude-editors'].includes(ed)) return false;
+  return true;
+}
+function norm(s) {
+  const o = {};
+  for (const [k, v] of Object.entries(s)) if (!k.startsWith('x-')) o[k] = v;
+  let t = s.command ? 'stdio' : (s.type || 'http');
+  if (t === 'streamable-http' || t === 'streamableHttp') t = 'http';
+  o.type = t;
+  return o;
+}
+const dropMsg = ed => "${VAR:-default} fallbacks aren't supported by " + ed + '; the defaults were dropped';
+
+// Refs an editor can't expand go through the FALLBACK policy.
+function applyFb(server, pol, paths) {
+  if (!paths.length) return { server, warn: [] };
+  const where = paths.map(p => p.join('.')).join(', ');
+  if (pol === 'resolve') {
+    const s = clone(server);
+    for (const p of paths) setPath(s, p, resolve(getPath(s, p)));
+    return { server: s, warn: ['wrote resolved values IN PLAINTEXT for ' + where + ' (FALLBACK=resolve)'] };
+  }
+  if (pol === 'keep') return { server, warn: ['${VAR} left unexpanded in ' + where + "; this editor won't expand it there"] };
+  return { server: null, warn: ["skipped: this editor can't expand ${VAR} in " + where + ' (set FALLBACK=resolve or keep to include it)'] };
+}
+function refPaths(server, roots) {
+  return strings(server)
+    .filter(([p, s]) => hasRef(s) && roots.some(r => r.every((k, i) => p[i] === k)))
+    .map(([p]) => p);
+}
+
+// Cursor, VS Code, Devin: ${env:NAME} in command/args/env/url/headers.
+function trEnvColon(s, ed) {
+  let o = mapStr(s, envColon);
+  if (ed === 'cursor') o = without(o, 'type');
+  else if (ed === 'devin') o = o.type === 'stdio' ? without(o, 'type') : Object.assign(without(o, 'type'), { transport: o.type });
+  return { server: o, warn: anyDefault(s) ? [dropMsg(ed)] : [] };
+}
+// Gemini CLI expands $VAR, ${VAR} and ${VAR:-default} in every string of settings.json.
+function trGemini(s) {
+  let o = without(s, 'type');
+  if (s.type === 'http') { o = without(o, 'url'); o.httpUrl = s.url; }
+  return { server: o, warn: [] };
+}
+// Claude Desktop: no expansion, small default env for servers, stdio only (remote via mcp-remote).
+function trDesktop(s, pol, plat) {
+  if (s.type === 'stdio') {
+    const r = applyFb(s, pol, refPaths(s, [['command'], ['args'], ['env']]));
+    if (r.server) r.server = without(r.server, 'type');
+    return r;
+  }
+  const r = applyFb(s, pol, refPaths(s, [['url'], ['headers']]));
+  if (!r.server) return r;
+  const x = r.server, headers = x.headers || {};
+  const args = ['-y', 'mcp-remote', x.url];
+  if (x.type === 'sse') args.push('--transport', 'sse-only');
+  for (const [k, v] of Object.entries(headers)) args.push('--header', k + ':' + String(v));
+  r.warn.push("bridged through mcp-remote (Claude Desktop's config file only starts local servers)");
+  if (plat === 'windows' && Object.values(headers).some(v => String(v).includes(' ')))
+    r.warn.push('a header value contains a space; Claude Desktop on Windows can split it when starting npx (see the mcp-remote README)');
+  r.server = { command: 'npx', args };
+  return r;
+}
+// Codex: no ${VAR} expansion; secrets come in through env_vars (forwarded from Codex's own
+// environment), bearer_token_env_var and env_http_headers. Streamable HTTP only, no SSE.
+function trCodex(s, pol) {
+  if (s.type === 'sse') return { server: null, warn: ['skipped: Codex supports stdio and streamable HTTP servers, not SSE'] };
+  const unsupported = [];
+  for (const [p, str] of strings(s)) {
+    if (!hasRef(str)) continue;
+    const root = p[0], key = p[1];
+    const ident = str.match(IDENT);
+    if (root === 'env' && p.length === 2 && ident && ident[1] === key) continue;
+    if (root === 'headers' && p.length === 2 && (ident || (String(key).toLowerCase() === 'authorization' && BEARER.test(str)))) continue;
+    unsupported.push(p);
+  }
+  const r = applyFb(s, pol, unsupported);
+  if (!r.server) return r;
+  const x = r.server, o = {};
+  if (x.type === 'stdio') {
+    o.command = x.command;
+    if (x.args) o.args = x.args;
+    const env = {}, envVars = [];
+    for (const [k, v] of Object.entries(x.env || {})) {
+      const m = typeof v === 'string' ? v.match(IDENT) : null;
+      if (m && m[1] === k) envVars.push(k); else env[k] = v;
+    }
+    if (Object.keys(env).length) o.env = env;
+    if (envVars.length) o.env_vars = envVars;
+  } else {
+    o.url = x.url;
+    const http = {}, envHttp = {};
+    for (const [k, v] of Object.entries(x.headers || {})) {
+      let m = null;
+      if (typeof v === 'string' && k.toLowerCase() === 'authorization' && (m = v.match(BEARER))) o.bearer_token_env_var = m[1];
+      else if (typeof v === 'string' && (m = v.match(IDENT))) envHttp[k] = m[1];
+      else http[k] = v;
+    }
+    if (Object.keys(http).length) o.http_headers = http;
+    if (Object.keys(envHttp).length) o.env_http_headers = envHttp;
+  }
+  // Only copy keys Codex documents; others (e.g. Cursor/Gemini-specific ones) could make Codex reject the file.
+  const CODEX_KEYS = ['cwd', 'startup_timeout_sec', 'tool_timeout_sec', 'enabled', 'required', 'enabled_tools',
+    'disabled_tools', 'default_tools_approval_mode', 'tools', 'scopes', 'auth', 'environment_id', 'startup_readiness'];
+  for (const [k, v] of Object.entries(x)) if (CODEX_KEYS.includes(k)) o[k] = v;
+  if (x.disabled === true && o.enabled === undefined) o.enabled = false;
+  r.server = o;
+  return r;
+}
+function translate(s, ed, pol, plat) {
+  switch (ed) {
+    case 'claude-code': return { server: s, warn: [] };
+    case 'cursor': case 'vscode': case 'devin': return trEnvColon(s, ed);
+    case 'gemini': return trGemini(s);
+    case 'claude-desktop': return trDesktop(s, pol, plat);
+    case 'codex': return trCodex(s, pol);
+  }
+  fail('unknown editor: ' + ed);
+}
+function wrapNpx(r, wrap) {
+  if (wrap && r.server && r.server.command === 'npx')
+    r.server = Object.assign({}, r.server, { command: 'cmd', args: ['/c', 'npx'].concat(r.server.args || []) });
+  return r;
+}
+// WSL_ prefix in an env block: WSL_NAME replaces NAME on WSL and is dropped everywhere else.
+const WSL_PREFIX = 'WSL_';
+const isWslKey = k => k.startsWith(WSL_PREFIX) && k.length > WSL_PREFIX.length;
+function applyWslEnv(s, plat) {
+  if (!isObj(s.env) || !Object.keys(s.env).some(isWslKey)) return s;
+  const env = {};
+  for (const [k, v] of Object.entries(s.env)) if (!isWslKey(k)) env[k] = v;
+  if (plat === 'wsl') for (const [k, v] of Object.entries(s.env)) if (isWslKey(k)) env[k.slice(WSL_PREFIX.length)] = v;
+  return Object.assign({}, s, { env });
+}
+// On WSL a Windows drive path in "command" (C:\tools\x.exe) becomes /mnt/c/tools/x.exe.
+// WSL runs Windows executables through /mnt/c, but cannot resolve the backslash form.
+function wslCommand(s, plat) {
+  if (plat !== 'wsl' || typeof s.command !== 'string') return s;
+  const m = s.command.match(/^([A-Za-z]):[\\/](.*)$/);
+  if (!m) return s;
+  return Object.assign({}, s, { command: '/mnt/' + m[1].toLowerCase() + '/' + m[2].replace(/\\/g, '/') });
+}
+function generate(src, ed, pol, plat, wrap) {
+  const g = { servers: {}, warnings: [], skipped: [] };
+  for (const [name, raw] of Object.entries(src.mcpServers || {})) {
+    if (!isObj(raw) || !forEditor(raw, ed)) continue;
+    const r = wrapNpx(translate(norm(wslCommand(applyWslEnv(raw, plat), plat)), ed, pol, plat), wrap);
+    for (const w of r.warn) g.warnings.push(name + ': ' + w);
+    if (r.server) g.servers[name] = r.server; else g.skipped.push(name);
+  }
+  return g;
+}
+
+// ---------- planning: remove what we wrote last time, keep the rest, add the current set
+function planJson(file, key, gen, prev) {
+  const { data, jsonc } = parseJsonFile(file);
+  if (!isObj(data)) fail(file + ' must contain a JSON object');
+  const cur = isObj(data[key]) ? data[key] : {};
+  const next = {};
+  for (const [k, v] of Object.entries(cur)) if (!prev.includes(k) && !(k in gen.servers)) next[k] = v;
+  Object.assign(next, gen.servers);
+  const res = Object.assign({}, data); res[key] = next;
+  return {
+    newText: JSON.stringify(res, null, 2) + '\n',
+    takeover: Object.keys(gen.servers).filter(n => n in cur && !prev.includes(n)),
+    jsonc,
+    before: JSON.stringify(sortKeys(cur), null, 2) + '\n',
+    after: JSON.stringify(sortKeys(next), null, 2) + '\n',
+  };
+}
+function planToml(text, gen, prev) {
+  text = text || '';
+  const eol = text.includes('\r\n') ? '\r\n' : '\n';
+  const blocks = tomlBlocks(text);
+  const existing = new Set(blocks.filter(isServerBlock).map(b => b.path[1]));
+  const drop = new Set(prev.concat(Object.keys(gen.servers)));
+  // A dropped block keeps its trailing comment lines: they usually describe the next table.
+  const tail = b => {
+    let k = b.lines.length;
+    while (k > 1 && /^\s*(#.*)?$/.test(b.lines[k - 1])) k--;
+    const t = b.lines.slice(k);
+    return t.some(l => l.trim().startsWith('#')) ? t : [];
+  };
+  const lines = trimEnd(blocks.flatMap(b => (isServerBlock(b) && drop.has(b.path[1]) ? tail(b) : b.lines)));
+  for (const [name, o] of Object.entries(gen.servers)) { if (lines.length) lines.push(''); lines.push(...serverToml(name, o)); }
+  const newText = lines.length ? lines.join(eol) + eol : '';
+  return {
+    newText,
+    takeover: Object.keys(gen.servers).filter(n => existing.has(n) && !prev.includes(n)),
+    jsonc: false,
+    before: tomlSection(text),
+    after: tomlSection(newText),
+  };
+}
+
+// ---------- editor -> source (import)
+function fromEditor(ed, s) {
+  let o = mapStr(s, unEnv);
+  if (ed === 'gemini') {
+    o = mapStr(o, x => x.replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, (_, n) => '${' + n + '}'));
+    if (o.httpUrl) { o.url = o.httpUrl; o.type = 'http'; delete o.httpUrl; } else if (o.url) o.type = 'sse';
+  } else if (ed === 'devin' && o.transport) {
+    o.type = o.transport; delete o.transport;
+  } else if (ed === 'codex') {
+    if (Array.isArray(o.env_vars)) {
+      o.env = Object.assign({}, o.env);
+      for (const v of o.env_vars) { const n = typeof v === 'string' ? v : (v && v.name); if (n) o.env[n] = '${' + n + '}'; }
+      delete o.env_vars;
+    }
+    if (o.url) {
+      o.type = 'http';
+      const h = Object.assign({}, o.http_headers);
+      for (const [k, n] of Object.entries(o.env_http_headers || {})) h[k] = '${' + n + '}';
+      if (o.bearer_token_env_var) h.Authorization = 'Bearer ${' + o.bearer_token_env_var + '}';
+      if (Object.keys(h).length) o.headers = h;
+      delete o.http_headers; delete o.env_http_headers; delete o.bearer_token_env_var;
+    }
+  }
+  if (o.command) delete o.type;
+  return o;
+}
+const secretish = k => /(key|token|secret|passw)/i.test(k) || /^authorization$/i.test(k);
+function literalSecrets(s) {
+  const found = [];
+  for (const [k, v] of Object.entries(s.env || {})) if (secretish(k) && typeof v === 'string' && v && !hasRef(v)) found.push('env.' + k);
+  for (const [k, v] of Object.entries(s.headers || {})) if (secretish(k) && typeof v === 'string' && !hasRef(v)) found.push('headers.' + k);
+  if (typeof s.url === 'string' && /[?&][^=&]*(key|token|secret)[^=&]*=[^&]/i.test(s.url) && !hasRef(s.url)) found.push('url');
+  if ((s.args || []).some(x => typeof x === 'string' && /(key|token|secret)[^=]*=./i.test(x) && !hasRef(x))) found.push('args');
+  return found;
+}
+
+// ---------- commands
+const [op, ...a] = process.argv.slice(2);
+const readSrc = f => parseJsonFile(f).data;
+switch (op) {
+  case 'validate': {
+    const src = readSrc(a[0]), sup = a[1].split(','), probs = [];
+    if (!isObj(src)) fail(a[0] + ' must contain a JSON object');
+    if (src.mcpServers !== undefined && !isObj(src.mcpServers)) probs.push('  "mcpServers" must be an object');
+    for (const [n, s] of Object.entries(isObj(src.mcpServers) ? src.mcpServers : {})) {
+      if (!isObj(s)) { probs.push('  ' + n + ': must be an object'); continue; }
+      if (!s.command && !s.url) probs.push('  ' + n + ': needs "command" (local server) or "url" (remote server)');
+      for (const e of [].concat(s['x-editors'] || [], s['x-exclude-editors'] || []))
+        if (!sup.includes(e)) probs.push('  ' + n + ': unknown editor "' + e + '"');
+    }
+    out(probs.join('\n'));
+    break;
+  }
+  case 'generate': {
+    const [srcFile, ed, pol, plat, wrap] = a;
+    out(JSON.stringify(generate(readSrc(srcFile), ed, pol, plat, wrap === 'true')));
+    break;
+  }
+  case 'gen': {
+    const g = JSON.parse(readText(a[0]));
+    if (a[1] === 'warnings') out(g.warnings.join('\n'));
+    else if (a[1] === 'skipped') out(g.skipped.join('\n'));
+    else if (a[1] === 'count') out(String(Object.keys(g.servers).length));
+    break;
+  }
+  case 'plan': {
+    const [fmt, key, file, genFile, stateFile, stateKey, newF, befF, aftF] = a;
+    const gen = JSON.parse(readText(genFile));
+    const prev = ((readState(stateFile)[stateKey] || {}).servers) || [];
+    const r = fmt === 'toml' ? planToml(readText(file), gen, prev) : planJson(file, key, gen, prev);
+    fs.writeFileSync(newF, r.newText);
+    fs.writeFileSync(befF, r.before);
+    fs.writeFileSync(aftF, r.after);
+    const notes = r.takeover.map(n => 'takeover\t' + n);
+    if (r.jsonc) notes.push('jsonc\t-');
+    out(notes.join('\n'));
+    break;
+  }
+  case 'state-set': {
+    const [stateFile, stateKey, file, genFile] = a;
+    const st = readState(stateFile);
+    st[stateKey] = { file, servers: Object.keys(JSON.parse(readText(genFile)).servers).sort(), synced_at: new Date().toISOString() };
+    fs.writeFileSync(stateFile + '.tmp', JSON.stringify(st, null, 2) + '\n');
+    fs.renameSync(stateFile + '.tmp', stateFile);
+    break;
+  }
+  case 'names': out(refNames(readSrc(a[0]).mcpServers || {}).join('\n')); break;
+  case 'count': out(String(Object.keys(readSrc(a[0]).mcpServers || {}).length)); break;
+  case 'list': {
+    const rows = [];
+    for (const [n, s] of Object.entries(readSrc(a[0]).mcpServers || {})) {
+      const ex = s['x-exclude-editors'];
+      rows.push([n, norm(s).type,
+        (s['x-editors'] || ['all']).join(',') + (ex && ex.length ? ' -' + ex.join(',-') : ''),
+        refNames(s).join(',') || '-'].join('\t'));
+    }
+    out(rows.join('\n'));
+    break;
+  }
+  case 'risky': {
+    const found = new Set();
+    for (const [n, s] of Object.entries(readSrc(a[0]).mcpServers || {}))
+      for (const str of [s.url].concat(Object.values(s.headers || {})))
+        if (typeof str === 'string')
+          for (const m of str.matchAll(REF))
+            if (/^(ANTHROPIC_|CLAUDE_|AWS_|GOOGLE_APPLICATION)|_PROXY$|^NPM_TOKEN$/.test(m[1])) found.add(n + ': ' + m[1]);
+    out([...found].join('\n'));
+    break;
+  }
+  case 'import': {
+    const [ed, fmt, key, edFile, srcFile, force, newSrc] = a;
+    const txt = readText(edFile);
+    if (txt === null) fail('not found: ' + edFile);
+    const servers = fmt === 'toml' ? parseTomlServers(txt) : ((parseJsonFile(edFile).data || {})[key] || {});
+    const srcData = readText(srcFile) === null ? { mcpServers: {} } : readSrc(srcFile);
+    const cur = isObj(srcData.mcpServers) ? srcData.mcpServers : {};
+    const merged = Object.assign({}, cur), lines = [];
+    for (const [n, s] of Object.entries(servers)) {
+      if (!isObj(s)) continue;
+      if (n in cur && force !== 'true') { lines.push('kept\t' + n); continue; }
+      const conv = fromEditor(ed, s);
+      lines.push((n in cur ? 'replaced\t' : 'added\t') + n);
+      merged[n] = conv;
+      for (const p of literalSecrets(conv)) lines.push('secret\t' + n + '.' + p);
+    }
+    srcData.mcpServers = merged;
+    fs.writeFileSync(newSrc, JSON.stringify(srcData, null, 2) + '\n');
+    out(lines.join('\n'));
+    break;
+  }
+  default: fail('unknown engine op: ' + op);
+}
+NODE_ENGINE
+
+setup_engine() {
+  command -v node >/dev/null 2>&1 ||
+    die "Node.js 16+ is required (it also runs your npx-based MCP servers). Windows: winget install OpenJS.NodeJS.LTS"
+  local major
+  major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null | tr -d '\r')"
+  [[ ${major:-0} -ge 16 ]] || die "Node.js 16+ is required (found $(node --version 2>/dev/null | tr -d '\r'))"
+  ENGINE="$TMPROOT/mcpsync-engine.js"
+  printf '%s\n' "$ENGINE_JS" > "$ENGINE"
+}
+eng()  { node "$ENGINE" "$@"; }
+engr() { node "$ENGINE" "$@" | tr -d '\r'; }
+
+# ---------------------------------------------------------------- PowerShell (Windows user env)
+read -r -d '' PS_SET <<'PS' || true
+[Environment]::SetEnvironmentVariable($env:MCPSYNC_NAME, $env:MCPSYNC_VAL, 'User')
+$w = [Environment]::GetEnvironmentVariable('WSLENV', 'User'); if (-not $w) { $w = '' }
+$parts = @($w -split ':' | Where-Object { $_ -ne '' })
+if (-not ($parts | Where-Object { ($_ -split '/')[0] -eq $env:MCPSYNC_NAME })) { $parts += ($env:MCPSYNC_NAME + '/u') }
+[Environment]::SetEnvironmentVariable('WSLENV', ($parts -join ':'), 'User')
+PS
+read -r -d '' PS_UNSET <<'PS' || true
+[Environment]::SetEnvironmentVariable($env:MCPSYNC_NAME, $null, 'User')
+$w = [Environment]::GetEnvironmentVariable('WSLENV', 'User'); if (-not $w) { $w = '' }
+$parts = @($w -split ':' | Where-Object { $_ -ne '' -and ($_ -split '/')[0] -ne $env:MCPSYNC_NAME })
+[Environment]::SetEnvironmentVariable('WSLENV', ($parts -join ':'), 'User')
+PS
+read -r -d '' PS_WSLENV_ADD <<'PS' || true
+$w = [Environment]::GetEnvironmentVariable('WSLENV', 'User'); if (-not $w) { $w = '' }
+$parts = @($w -split ':' | Where-Object { $_ -ne '' })
+foreach ($x in ($env:MCPSYNC_NAME -split ',')) {
+  if ($x -and -not ($parts | Where-Object { ($_ -split '/')[0] -eq $x })) { $parts += ($x + '/u') }
+}
+[Environment]::SetEnvironmentVariable('WSLENV', ($parts -join ':'), 'User')
+PS
+read -r -d '' PS_USER_NAMES <<'PS' || true
+[Environment]::GetEnvironmentVariables('User').Keys | ForEach-Object { $_ }
+PS
+read -r -d '' PS_USER_WSLENV <<'PS' || true
+[Environment]::GetEnvironmentVariable('WSLENV', 'User')
+PS
+
+have_powershell() { command -v powershell.exe >/dev/null 2>&1; }
+on_windows_env() { [[ $PLATFORM == windows || $PLATFORM == wsl ]] && have_powershell; }
+
+# Runs a PowerShell snippet. Values travel via MCPSYNC_NAME / MCPSYNC_VAL env vars, never argv.
+ps_run() {
+  local enc
+  enc="$(printf '%s' "$1" | iconv -f UTF-8 -t UTF-16LE | base64 | tr -d '\r\n')"
+  if [[ $PLATFORM == wsl ]]; then
+    WSLENV="${WSLENV:+$WSLENV:}MCPSYNC_NAME:MCPSYNC_VAL" \
+      powershell.exe -NoProfile -NonInteractive -EncodedCommand "$enc" | tr -d '\r'
+  else
+    MSYS2_ENV_CONV_EXCL='MCPSYNC_VAL' MSYS_NO_PATHCONV=1 \
+      powershell.exe -NoProfile -NonInteractive -EncodedCommand "$enc" | tr -d '\r'
+  fi
+}
+
+# ---------------------------------------------------------------- files & state
+load_config() {
+  if [[ -f $CONFIG_FILE ]]; then
+    # shellcheck disable=SC1090
+    . "$CONFIG_FILE"
+  fi
+  return 0
+}
+
+require_source() {
+  [[ -f $SOURCE_FILE ]] || die "no source config at $SOURCE_FILE. Run: mcpsync$([[ $SCOPE == project ]] && echo ' --project') init"
+}
+
+validate_source() {
+  local problems
+  problems="$(engr validate "$SOURCE_FILE" "$(IFS=,; echo "${SUPPORTED_EDITORS[*]}")")"
+  [[ -z $problems ]] || die "problems in $SOURCE_FILE:"$'\n'"$problems"
+}
+
+write_file() { # write_file <target> <file-with-content> — atomic, follows symlinks
+  local target=$1 content=$2 real dir out
+  real="$target"
+  if [[ -L $target ]]; then real="$(readlink -f "$target")"; fi
+  dir="$(dirname "$real")"
+  mkdir -p "$dir"
+  out="$(mktemp "$dir/.mcpsync.XXXXXX")"
+  cat "$content" > "$out"
+  if [[ -e $real ]]; then chmod --reference="$real" "$out" 2>/dev/null || true; fi
+  mv -f "$out" "$real"
+}
+
+backup_file() { # backup_file <file> <label>
+  local f=$1 label=$2 ext dest old
+  [[ -f $f ]] || return 0
+  ext="${f##*.}"
+  mkdir -p "$BACKUP_DIR"
+  dest="$BACKUP_DIR/$label.$(date +%Y%m%d-%H%M%S).$ext"
+  cp -p "$f" "$dest"
+  chmod 600 "$dest" 2>/dev/null || true
+  ls -1t "$BACKUP_DIR/$label".*."$ext" 2>/dev/null | tail -n +$((BACKUPS + 1)) |
+    while IFS= read -r old; do rm -f -- "$old"; done
+  return 0
+}
+
+backup_label() { # editor -> filename-safe label
+  local b
+  if [[ $SCOPE == project ]]; then
+    b="$(basename "$PROJECT_DIR")"
+    printf '%s.%s' "${b//[^A-Za-z0-9._-]/_}" "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+# ---------------------------------------------------------------- planning
+generate() { # editor -> writes {servers, warnings, skipped} JSON to stdout
+  local ed=$1 wrap=false w
+  for w in $NPX_WRAP_EDITORS; do if [[ $w == "$ed" ]]; then wrap=true; fi; done
+  if [[ $PLATFORM != windows ]]; then wrap=false; fi
+  eng generate "$SOURCE_FILE" "$ed" "$FALLBACK" "$PLATFORM" "$wrap"
+}
+
+# plan_one <editor> — sets P_FILE P_FMT P_GEN P_NEW P_BEFORE P_AFTER P_NOTES
+plan_one() {
+  local ed=$1
+  P_FILE="$(editor_file "$ed")"
+  P_FMT="$(editor_format "$ed")"
+  P_GEN="$TMPROOT/$ed.gen.json"
+  P_NEW="$TMPROOT/$ed.new"
+  P_BEFORE="$TMPROOT/$ed.before"
+  P_AFTER="$TMPROOT/$ed.after"
+  P_NOTES="$TMPROOT/$ed.notes"
+  generate "$ed" > "$P_GEN"
+  engr plan "$P_FMT" "$(servers_key "$ed")" "$P_FILE" "$P_GEN" "$STATE_FILE" "$STATE_PREFIX$ed" \
+    "$P_NEW" "$P_BEFORE" "$P_AFTER" > "$P_NOTES"
+}
+plan_changed() { ! cmp -s "$P_BEFORE" "$P_AFTER"; }
+
+sync_one() { # sync_one <editor> <dry:true|false>
+  local ed=$1 dry=$2 f kind val line
+  is_supported "$ed" || die "unknown editor: $ed (supported: ${SUPPORTED_EDITORS[*]})"
+  f="$(editor_file "$ed")"
+  if [[ -z $f ]]; then warn "$ed has no project-level MCP file; skipped"; return 0; fi
+  plan_one "$ed"
+
+  engr gen "$P_GEN" warnings | while IFS= read -r line; do warn "$ed › $line"; done
+  while IFS=$'\t' read -r kind val; do
+    case $kind in
+      takeover) warn "$ed › '$val' already exists there and will be replaced by the one in your source" ;;
+      jsonc) warn "$ed › $P_FILE has comments or trailing commas; they'll be removed on write (a backup is kept)" ;;
+    esac
+  done < "$P_NOTES"
+
+  if ! plan_changed; then
+    ok "$ed: up to date  ${C_D}$P_FILE${C_0}"
+  elif [[ $dry == true ]]; then
+    info "${C_B}$ed${C_0} → $P_FILE ${C_D}(dry run)${C_0}"
+    diff -u -L "current" -L "after sync" "$P_BEFORE" "$P_AFTER" || true
+  else
+    backup_file "$P_FILE" "$(backup_label "$ed")"
+    write_file "$P_FILE" "$P_NEW"
+    ok "$ed: $(engr gen "$P_GEN" count) server(s) → $P_FILE"
+  fi
+  if [[ $dry != true ]]; then
+    mkdir -p "$MCPSYNC_HOME"
+    eng state-set "$STATE_FILE" "$STATE_PREFIX$ed" "$P_FILE" "$P_GEN"
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------- commands
+cmd_sync() {
+  local dry=false eds=() a ed
+  for a in "$@"; do
+    case $a in
+      -n|--dry-run) dry=true ;;
+      -*) die "unknown option: $a" ;;
+      *) eds+=("$a") ;;
+    esac
+  done
+  require_source
+  validate_source
+  if ((${#eds[@]} == 0)); then
+    [[ -n ${EDITORS// /} ]] || die "no editors configured. Run: mcpsync init   (or pass editor names)"
+    read -r -a eds <<< "$EDITORS"
+  fi
+  for ed in "${eds[@]}"; do sync_one "$ed" "$dry"; done
+  if [[ $dry == false ]]; then info "${C_D}Fully quit and reopen the editors to load the changes.${C_0}"; fi
+}
+
+cmd_status() {
+  require_source
+  validate_source
+  local ed st en f
+  printf '%-15s %-8s %-12s %s\n' EDITOR ENABLED STATE FILE
+  for ed in "${SUPPORTED_EDITORS[@]}"; do
+    en=no; if is_enabled "$ed"; then en=yes; fi
+    if [[ $en == no ]] && ! editor_detected "$ed"; then continue; fi
+    f="$(editor_file "$ed")"
+    if [[ -z $f ]]; then continue; fi
+    plan_one "$ed"
+    if [[ ! -e $P_FILE ]]; then st="not created"
+    elif plan_changed; then st="out of sync"
+    else st="in sync"; fi
+    printf '%-15s %-8s %-12s %s\n' "$ed" "$en" "$st" "$P_FILE"
+  done
+}
+
+cmd_list() {
+  require_source
+  validate_source
+  { printf 'NAME\tTYPE\tEDITORS\tVARIABLES\n'; engr list "$SOURCE_FILE"; } |
+    if command -v column >/dev/null 2>&1; then column -t -s $'\t'; else cat; fi
+}
+
+cmd_editors() {
+  local ed d en f
+  for ed in "${SUPPORTED_EDITORS[@]}"; do
+    d=no;  if editor_detected "$ed"; then d=yes; fi
+    en=no; if is_enabled "$ed"; then en=yes; fi
+    f="$(editor_file "$ed")"
+    printf '%-15s detected=%-4s enabled=%-4s %s\n' "$ed" "$d" "$en" "${f:-(no project-level file)}"
+  done
+}
+
+write_config() { # write_config "<editors>"
+  cat > "$CONFIG_FILE" <<EOF
+# mcpsync settings (sourced by bash)
+
+# Editors to sync. Supported: ${SUPPORTED_EDITORS[*]}
+EDITORS="$1"
+
+# When an editor can't expand a \${VAR} reference
+# (Claude Desktop: anywhere; Codex: anything except NAME="\${NAME}" env entries,
+#  Authorization="Bearer \${X}" and Header="\${X}"):
+#   skip    - leave that server out for that editor (default; never writes secrets to disk)
+#   resolve - write the current value in plaintext (only for user-level files)
+#   keep    - write \${VAR} as-is (the editor will see the literal text)
+FALLBACK="skip"
+
+# Timestamped backups kept per editor in $BACKUP_DIR
+BACKUPS=10
+
+# Windows only: editors where "npx ..." becomes "cmd /c npx ..." (e.g. "claude-code codex")
+NPX_WRAP_EDITORS=""
+
+# Override where an editor's user-level config lives (Windows or Unix paths both work):
+# PATH_CURSOR="\$HOME/.cursor/mcp.json"
+# PATH_CODEX="\$HOME/.codex/config.toml"
+# PATH_VSCODE="\$APPDATA/Code - Insiders/User/mcp.json"
+EOF
+}
+
+cmd_init() {
+  local chosen="" force=false from="" ed d ans p=""
+  while (($#)); do
+    case $1 in
+      --editors) chosen=${2:-}; shift 2 || die "$1 needs a value" ;;
+      --editors=*) chosen=${1#*=}; shift ;;
+      --from) from=${2:-}; shift 2 || die "$1 needs a value" ;;
+      --from=*) from=${1#*=}; shift ;;
+      --force) force=true; shift ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  mkdir -p "$MCPSYNC_HOME"
+
+  if [[ $SCOPE == user ]]; then
+    if [[ -f $CONFIG_FILE && $force == false ]]; then
+      ok "settings already exist: $CONFIG_FILE (use --force to redo)"
+    else
+      if [[ -z $chosen ]]; then
+        if [[ -t 0 ]]; then
+          info "Which editors do you use? (detected ones default to yes)"
+          for ed in "${SUPPORTED_EDITORS[@]}"; do
+            if editor_detected "$ed"; then d=Y; else d=N; fi
+            if [[ $d == Y ]]; then ans="Y/n"; else ans="y/N"; fi
+            read -r -p "  $ed [$ans] " ans || ans=""
+            ans=${ans:-$d}
+            if [[ $ans =~ ^[Yy] ]]; then chosen+="${chosen:+ }$ed"; fi
+          done
+        else
+          for ed in "${SUPPORTED_EDITORS[@]}"; do
+            if editor_detected "$ed"; then chosen+="${chosen:+ }$ed"; fi
+          done
+        fi
+      fi
+      for ed in $chosen; do is_supported "$ed" || die "unknown editor: $ed"; done
+      write_config "$chosen"
+      EDITORS=$chosen
+      ok "wrote $CONFIG_FILE (editors: ${chosen:-none})"
+    fi
+  fi
+
+  if [[ ! -f $SOURCE_FILE ]]; then
+    printf '{\n  "mcpServers": {}\n}\n' > "$SOURCE_FILE"
+    ok "created $SOURCE_FILE"
+  else
+    ok "source already exists: $SOURCE_FILE"
+  fi
+  if [[ -n $from ]]; then cmd_import "$from"; fi
+
+  if [[ $SCOPE == project ]]; then p=" --project"; fi
+  info ""
+  info "Next:"
+  info "  mcpsync$p edit               define servers; write secrets as \${VAR}"
+  info "  mcpsync secret set VAR       store each secret once"
+  info "  mcpsync$p sync --dry-run     preview"
+  info "  mcpsync$p sync"
+}
+
+cmd_import() {
+  local ed="" force=false a f kind val
+  for a in "$@"; do
+    case $a in
+      --force) force=true ;;
+      -*) die "unknown option: $a" ;;
+      *) ed=$a ;;
+    esac
+  done
+  [[ -n $ed ]] || die "usage: mcpsync import <editor> [--force]"
+  is_supported "$ed" || die "unknown editor: $ed"
+  f="$(editor_file "$ed")"
+  [[ -n $f && -s $f ]] || die "nothing to import: ${f:-$ed has no file in this scope} not found"
+  mkdir -p "$(dirname "$SOURCE_FILE")"
+
+  engr import "$ed" "$(editor_format "$ed")" "$(servers_key "$ed")" "$f" "$SOURCE_FILE" "$force" \
+    "$TMPROOT/source.new" > "$TMPROOT/import.notes"
+  write_file "$SOURCE_FILE" "$TMPROOT/source.new"
+
+  while IFS=$'\t' read -r kind val; do
+    case $kind in
+      added) ok "imported $val" ;;
+      replaced) warn "replaced $val" ;;
+      kept) info "  $val is already in the source (use --force to overwrite)" ;;
+      secret) warn "$val looks like a hardcoded secret → replace it with \${VAR} in the source, then: mcpsync secret set VAR" ;;
+    esac
+  done < "$TMPROOT/import.notes"
+  return 0
+}
+
+cmd_edit() {
+  require_source
+  local ed="${VISUAL:-${EDITOR:-}}"
+  if [[ -z $ed ]]; then
+    if [[ $PLATFORM == windows ]] && command -v notepad >/dev/null 2>&1; then ed=notepad
+    elif command -v nano >/dev/null 2>&1; then ed=nano
+    else ed=vi; fi
+  fi
+  $ed "$SOURCE_FILE"
+  validate_source
+  ok "$SOURCE_FILE is valid. Preview with: mcpsync$([[ $SCOPE == project ]] && echo ' --project') sync --dry-run"
+}
+
+# ---------------------------------------------------------------- secrets
+source_var_names() { engr names "$SOURCE_FILE"; }
+
+report_vars() {
+  local names n where user_names="" user_wslenv=""
+  names="$(source_var_names)"
+  if [[ -z $names ]]; then info "  (the source references no \${VAR}s)"; return 0; fi
+  if on_windows_env; then
+    user_names="$(ps_run "$PS_USER_NAMES" || true)"
+    user_wslenv="$(ps_run "$PS_USER_WSLENV" || true)"
+  fi
+  for n in $names; do
+    where=""
+    if [[ -n ${!n:-} ]]; then where+="${where:+, }this shell"; fi
+    if grep -qixF "$n" <<< "$user_names"; then where+="${where:+, }Windows user env"; fi
+    if tr ':' '\n' <<< "$user_wslenv" | cut -d/ -f1 | grep -qixF "$n"; then where+="${where:+, }WSLENV"; fi
+    if [[ -f $SECRETS_FILE ]] && grep -q "^export $n=" "$SECRETS_FILE"; then where+="${where:+, }secrets.env"; fi
+    if [[ -z $where ]]; then
+      bad "$n — not set   → mcpsync secret set $n"
+    else
+      ok "$n — $where"
+      if [[ $PLATFORM == windows && $where != *"this shell"* && $where == *"Windows user env"* ]]; then
+        info "    ${C_D}set, but this shell started earlier; reopen terminals and editors${C_0}"
+      fi
+      if [[ $PLATFORM == wsl && $where != *"this shell"* && $where == *WSLENV* ]]; then
+        info "    ${C_D}run 'wsl --shutdown' from Windows and reopen WSL to pick it up${C_0}"
+      fi
+      if [[ -n $user_names && $where == *"Windows user env"* && $where != *WSLENV* ]]; then
+        info "    ${C_D}not shared with WSL → mcpsync secret wslenv${C_0}"
+      fi
+    fi
+  done
+  return 0
+}
+
+secrets_file_write() { # secrets_file_write NAME [VALUE]  (no VALUE = remove)
+  local n=$1 tmp esc
+  mkdir -p "$MCPSYNC_HOME"
+  touch "$SECRETS_FILE"; chmod 600 "$SECRETS_FILE"
+  tmp="$(mktemp "$MCPSYNC_HOME/.secrets.XXXXXX")"
+  chmod 600 "$tmp"
+  grep -v "^export $n=" "$SECRETS_FILE" > "$tmp" || true
+  if (($# > 1)); then
+    esc=${2//\'/\'\\\'\'}
+    printf "export %s='%s'\n" "$n" "$esc" >> "$tmp"
+  fi
+  mv -f "$tmp" "$SECRETS_FILE"
+}
+
+secrets_profile_hint() {
+  info "Load it from your shell profile (~/.bashrc, ~/.zshrc):"
+  info "  [ -f \"$SECRETS_FILE\" ] && . \"$SECRETS_FILE\""
+  if [[ $PLATFORM == mac ]]; then
+    info "${C_D}Apps started from the Dock don't read shell profiles; start editors from a terminal (cursor ., code .) or use launchctl setenv.${C_0}"
+  fi
+}
+
+secret_set() {
+  local n=${1:-} v=""
+  [[ $n =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "usage: mcpsync secret set NAME   (value is read from a hidden prompt or stdin)"
+  if [[ -t 0 ]]; then
+    read -r -s -p "Value for $n (hidden): " v; echo >&2
+  else
+    IFS= read -r v || true
+  fi
+  [[ -n $v ]] || die "empty value; nothing was set"
+  if [[ $PLATFORM == windows || $PLATFORM == wsl ]]; then
+    have_powershell || die "powershell.exe not found on PATH"
+    MCPSYNC_NAME="$n" MCPSYNC_VAL="$v" ps_run "$PS_SET" >/dev/null
+    ok "$n saved to your Windows user environment and shared with WSL (WSLENV)"
+    info "${C_D}Reopen terminals and editors so they see it. In WSL: 'wsl --shutdown' first.${C_0}"
+  else
+    secrets_file_write "$n" "$v"
+    ok "$n saved to $SECRETS_FILE"
+    secrets_profile_hint
+  fi
+}
+
+secret_unset() {
+  local n=${1:-}
+  [[ $n =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "usage: mcpsync secret unset NAME"
+  if [[ $PLATFORM == windows || $PLATFORM == wsl ]]; then
+    have_powershell || die "powershell.exe not found on PATH"
+    MCPSYNC_NAME="$n" ps_run "$PS_UNSET" >/dev/null
+    ok "$n removed from your Windows user environment and WSLENV"
+  else
+    secrets_file_write "$n"
+    ok "$n removed from $SECRETS_FILE"
+  fi
+}
+
+secret_wslenv() {
+  on_windows_env || die "WSLENV only applies on Windows (Git Bash) or inside WSL"
+  require_source
+  local names
+  names="$(source_var_names | paste -sd, -)"
+  if [[ -z $names ]]; then info "the source references no \${VAR}s"; return 0; fi
+  MCPSYNC_NAME="$names" ps_run "$PS_WSLENV_ADD" >/dev/null
+  ok "WSLENV now shares: ${names//,/ }"
+  info "${C_D}Run 'wsl --shutdown' and reopen WSL to pick it up.${C_0}"
+}
+
+cmd_secret() {
+  local sub=${1:-list}
+  if (($#)); then shift; fi
+  case $sub in
+    set) secret_set "$@" ;;
+    unset|rm) secret_unset "$@" ;;
+    list|ls) require_source; report_vars ;;
+    wslenv) secret_wslenv ;;
+    *) die "usage: mcpsync secret set|unset|list|wslenv [NAME]" ;;
+  esac
+}
+
+cmd_doctor() {
+  local risky line ed
+  info "mcpsync $MCPSYNC_VERSION · platform: $PLATFORM · node $(node --version | tr -d '\r') · scope: $SCOPE"
+  if [[ $SCOPE == user ]]; then
+    if [[ -f $CONFIG_FILE ]]; then ok "settings: $CONFIG_FILE (editors: ${EDITORS:-none})"
+    else warn "no settings yet → mcpsync init"; fi
+  fi
+  if [[ ! -f $SOURCE_FILE ]]; then warn "no source at $SOURCE_FILE → mcpsync init"; return 0; fi
+  validate_source
+  ok "source: $SOURCE_FILE ($(engr count "$SOURCE_FILE") servers)"
+
+  risky="$(engr risky "$SOURCE_FILE")"
+  if [[ -n $risky ]]; then
+    while IFS= read -r line; do
+      warn "$line — Claude Code sends credential variables like this as empty to remote servers; use a name of your own"
+    done <<< "$risky"
+  fi
+
+  info "variables:"
+  report_vars
+  if [[ $SCOPE == user && -n ${EDITORS// /} ]]; then
+    info "editors:"
+    for ed in $EDITORS; do
+      if ! is_supported "$ed"; then bad "$ed — unknown editor in $CONFIG_FILE"; continue; fi
+      if editor_detected "$ed"; then ok "$ed — $(editor_file "$ed")"; else warn "$ed — not detected ($(editor_file "$ed"))"; fi
+    done
+  fi
+  return 0
+}
+
+usage() {
+  cat <<EOF
+mcpsync $MCPSYNC_VERSION — one MCP config, synced to every editor you use.
+
+Usage: mcpsync [--project[=DIR]] <command> [args]
+
+Commands
+  init [--editors "a b"] [--from EDITOR] [--force]
+                         create settings + source; asks which editors you use
+  edit                   open the source in \$VISUAL/\$EDITOR (notepad on Windows) and validate it
+  list                   servers in the source, their type, editors and variables
+  sync [--dry-run] [EDITOR...]
+                         write the source into each editor's config (default: EDITORS)
+  diff [EDITOR...]       same as sync --dry-run
+  status                 per editor: in sync / out of sync / not created
+  import EDITOR [--force]
+                         copy servers from an editor's config into the source
+  editors                supported editors and where their configs live
+  secret set NAME        store a secret (Windows user env + WSLENV, else secrets.env)
+  secret unset NAME      remove it
+  secret list            which \${VAR}s the source uses and where each one is set
+  secret wslenv          share every \${VAR} the source uses with WSL
+  doctor                 check node, settings, source, variables and editors
+
+Scope
+  default                user-level configs; source: $MCPSYNC_HOME/mcp.json
+  --project[=DIR]        project files (.mcp.json, .cursor/mcp.json, .codex/config.toml,
+                         .vscode/mcp.json, .gemini/settings.json, .devin/mcp_config.json);
+                         source: DIR/.mcpsync.json
+
+Editors: ${SUPPORTED_EDITORS[*]}
+
+Source format (Claude Code style; mcpsync translates per editor):
+  {
+    "mcpServers": {
+      "dokploy": { "command": "npx", "args": ["-y", "@ahdev/dokploy-mcp"],
+                   "env": { "DOKPLOY_API_KEY": "\${DOKPLOY_API_KEY}" } },
+      "context7": { "type": "http", "url": "https://mcp.context7.com/mcp",
+                    "headers": { "CONTEXT7_API_KEY": "\${CONTEXT7_API_KEY}" },
+                    "x-editors": ["cursor", "claude-code"] }
+    }
+  }
+EOF
+}
+
+# ---------------------------------------------------------------- main
+main() {
+  local args=() a cmd
+  for a in "$@"; do
+    case $a in
+      --project) SCOPE=project; PROJECT_DIR=$PWD ;;
+      --project=*) SCOPE=project; PROJECT_DIR=${a#*=} ;;
+      *) args+=("$a") ;;
+    esac
+  done
+  set -- ${args[@]+"${args[@]}"}
+  cmd=${1:-help}
+  if (($#)); then shift; fi
+
+  case $cmd in
+    help|-h|--help) usage; return 0 ;;
+    version|-v|--version) echo "mcpsync $MCPSYNC_VERSION"; return 0 ;;
+  esac
+
+  TMPROOT="$(mktemp -d)"
+  trap 'rm -rf "$TMPROOT"' EXIT
+  setup_engine
+  load_config
+
+  if [[ $SCOPE == project ]]; then
+    PROJECT_DIR="$(to_unix_path "$PROJECT_DIR")"
+    [[ -d $PROJECT_DIR ]] || die "not a directory: $PROJECT_DIR"
+    PROJECT_DIR="$(cd "$PROJECT_DIR" && pwd)"
+    SOURCE_FILE="$PROJECT_DIR/.mcpsync.json"
+    # keep the state key free of slashes so Git Bash doesn't rewrite it as a path
+    STATE_PREFIX="project:$(printf '%s' "$PROJECT_DIR" | tr '/\\: ' '____'):"
+    if [[ $FALLBACK == resolve ]]; then
+      warn "FALLBACK=resolve is ignored for project files (they're often committed); using skip"
+      FALLBACK=skip
+    fi
+  fi
+  case $FALLBACK in skip|resolve|keep) ;; *) die "FALLBACK must be skip, resolve or keep (got '$FALLBACK')" ;; esac
+
+  case $cmd in
+    init)    cmd_init "$@" ;;
+    edit)    cmd_edit ;;
+    list|ls) cmd_list ;;
+    sync)    cmd_sync "$@" ;;
+    diff)    cmd_sync --dry-run "$@" ;;
+    status)  cmd_status ;;
+    import)  cmd_import "$@" ;;
+    editors) cmd_editors ;;
+    secret|secrets) cmd_secret "$@" ;;
+    doctor)  cmd_doctor ;;
+    *) die "unknown command: $cmd (see: mcpsync help)" ;;
+  esac
+}
+
+main "$@"

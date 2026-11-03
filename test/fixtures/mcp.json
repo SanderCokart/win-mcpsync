@@ -1,0 +1,48 @@
+{
+  "mcpServers": {
+    "context7": {
+      "type": "http",
+      "url": "https://mcp.context7.com/mcp",
+      "headers": {
+        "CONTEXT7_API_KEY": "${CONTEXT7_API_KEY}"
+      }
+    },
+    "github": {
+      "type": "http",
+      "url": "https://api.githubcopilot.com/mcp/",
+      "headers": {
+        "Authorization": "Bearer ${GITHUB_MCP_PAT}"
+      }
+    },
+    "dokploy-mcp": {
+      "command": "npx",
+      "args": ["-y", "@ahdev/dokploy-mcp"],
+      "env": {
+        "DOKPLOY_URL": "https://dokploy.example.com/api",
+        "DOKPLOY_API_KEY": "${DOKPLOY_API_KEY}"
+      }
+    },
+    "Ref": {
+      "type": "http",
+      "url": "https://api.ref.tools/mcp",
+      "headers": {
+        "x-ref-api-key": "${REF_API_KEY}"
+      }
+    },
+    "cloudreve": {
+      "command": "npx",
+      "args": ["-y", "github:example-user/cloudreve-mcp"],
+      "env": {
+        "CLOUDREVE_BASE_URL": "https://cloud.example.com",
+        "CLOUDREVE_CLIENT_ID": "${CLOUDREVE_CLIENT_ID}",
+        "CLOUDREVE_CLIENT_SECRET": "${CLOUDREVE_CLIENT_SECRET}",
+        "CLOUDREVE_AUTH_ENDPOINT": "https://cloud.example.com/session/authorize",
+        "CLOUDREVE_TOKEN_ENDPOINT": "https://cloud.example.com/api/v4/session/oauth/token",
+        "CLOUDREVE_REFRESH_ENDPOINT": "https://cloud.example.com/api/v4/session/token/refresh",
+        "CLOUDREVE_USERINFO_ENDPOINT": "https://cloud.example.com/api/v4/session/oauth/userinfo",
+        "CLOUDREVE_REDIRECT_URI": "http://127.0.0.1:53682/callback",
+        "CLOUDREVE_SCOPES": "openid offline_access profile email UserInfo.Write UserSecurityInfo.Write Files.Write Shares.Write Workflow.Write Finance.Write DavAccount.Write Admin.Write"
+      }
+    }
+  }
+}

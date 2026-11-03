@@ -1,0 +1,8 @@
+[package]
+name = "envsync"
+description = "Store secrets as Windows user environment variables and share them with WSL"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+envsync-core = { workspace = true }

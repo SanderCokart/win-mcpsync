@@ -1,0 +1,12 @@
+[package]
+name = "mcpsync"
+description = "Define MCP servers once and sync them to every editor you use (Windows)"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+envsync-core = { workspace = true }
+serde_json = { workspace = true }
+regex = { workspace = true }
+similar = { workspace = true }
+chrono = { workspace = true }

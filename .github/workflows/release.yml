@@ -1,0 +1,74 @@
+name: release
+
+# Push a tag like v1.0.0 (matching the version in Cargo.toml) to build, test and publish.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      TARGET: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag matches Cargo.toml version
+        shell: bash
+        run: |
+          v="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "Cargo.toml says $v but the tag is $GITHUB_REF_NAME"; exit 1; }
+
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt && rustup default stable
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Lint and unit tests
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+
+      - name: Build
+        run: cargo build --release --target ${{ env.TARGET }}
+
+      - name: Acceptance tests
+        shell: bash
+        run: bash test/run.sh "target/$TARGET/release/mcpsync.exe"
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          foreach ($app in 'mcpsync', 'envsync') {
+            Compress-Archive -Force -Path "target/$env:TARGET/release/$app.exe" -DestinationPath "dist/$app-$env:TARGET.zip"
+          }
+          $lines = Get-ChildItem dist/*.zip | Sort-Object Name | ForEach-Object {
+            '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $_.Name
+          }
+          [IO.File]::WriteAllText("$PWD/dist/SHA256SUMS", ($lines -join "`n") + "`n")
+
+      - name: Installers work against the packaged files
+        shell: pwsh
+        run: |
+          $env:WIN_MCPSYNC_DIST = "$PWD/dist"
+          $env:WIN_MCPSYNC_INSTALL_DIR = "$env:RUNNER_TEMP/ps-bin"
+          $env:WIN_MCPSYNC_NO_PATH = '1'
+          ./install.ps1
+          & "$env:RUNNER_TEMP/ps-bin/mcpsync.exe" --version
+          & "$env:RUNNER_TEMP/ps-bin/envsync.exe" --version
+          $env:WIN_MCPSYNC_INSTALL_DIR = "$env:RUNNER_TEMP/sh-bin"
+          bash ./install.sh
+          & "$env:RUNNER_TEMP/sh-bin/mcpsync.exe" --version
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes
